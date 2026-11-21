@@ -1,0 +1,140 @@
+// Сервер дуэлей. Deno Deploy (бесплатно) или локально:
+//   deno run --allow-net --unstable-kv server.ts
+// Хранилище — Deno KV (строго согласованное, подходит для опроса раз в секунду).
+
+const kv = await Deno.openKv();
+const TTL = 15 * 60 * 1000;      // комната живёт 15 минут
+const START_DELAY = 5000;         // отсчёт после входа второго игрока
+const MAX_RACE = 120 * 1000;      // гонка длится не дольше 2 минут
+const MAX_CPS = 25;               // античит: не больше 25 знаков в секунду
+
+const PHRASES = [
+  "быстрые пальцы всегда побеждают",
+  "съешь ещё этих мягких французских булок",
+  "кто успел тот и съел",
+  "тише едешь дальше будешь",
+  "семь раз отмерь один раз отрежь",
+  "лучше поздно чем никогда",
+  "без труда не вытащишь и рыбку из пруда",
+  "утро вечера мудренее",
+  "на дворе трава на траве дрова",
+  "карл у клары украл кораллы",
+  "шла саша по шоссе и сосала сушку",
+  "тридцать три корабля лавировали",
+  "клавиатура быстрее мысли",
+  "печатай быстро но без ошибок",
+  "один за всех и все за одного",
+  "волков бояться в лес не ходить",
+  "что посеешь то и пожнёшь",
+  "встань пораньше и поймай удачу",
+  "маленький шаг каждый день ведёт к цели",
+  "делу время а потехе час",
+];
+
+const json = (o: unknown) =>
+  new Response(JSON.stringify(o), {
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "access-control-allow-origin": "*",
+    },
+  });
+
+// Атомарное изменение комнаты с повтором при гонке запросов.
+async function mutate(room: string, fn: (v: any) => unknown): Promise<[any, unknown] | null> {
+  for (let i = 0; i < 6; i++) {
+    const e = await kv.get(["room", room]);
+    if (!e.value) return null;
+    const v: any = structuredClone(e.value);
+    const res = fn(v);
+    const ok = await kv.atomic().check(e).set(["room", room], v, { expireIn: TTL }).commit();
+    if (ok.ok) return [v, res];
+  }
+  return null;
+}
+
+function view(v: any, now: number) {
+  const pub = (p: any) => p && { name: p.name, pos: p.pos, err: p.err, time: p.time };
+  return {
+    status: v.status,            // waiting | running | finished
+    now,                         // серверное время для синхронизации старта
+    startAt: v.startAt,
+    text: v.b ? v.text : "",     // фраза скрыта, пока нет соперника
+    winner: v.winner,            // "a" | "b" | "" | "x"
+    left: v.left || "",
+    players: { a: pub(v.a), b: pub(v.b) },
+  };
+}
+
+Deno.serve(async (req) => {
+  const u = new URL(req.url), q = u.searchParams, now = Date.now();
+  const room = q.get("room") || "";
+  const you = q.get("you") === "b" ? "b" : "a";
+  const name = (q.get("name") || "Игрок").slice(0, 12);
+  const player = () => ({ name, pos: 0, err: 0, time: 0 });
+
+  switch (u.pathname) {
+    case "/create": {
+      for (let i = 0; i < 20; i++) {
+        const code = String(1000 + Math.floor(Math.random() * 9000));
+        const r = await kv.atomic()
+          .check({ key: ["room", code], versionstamp: null })
+          .set(["room", code], {
+            text: PHRASES[Math.floor(Math.random() * PHRASES.length)],
+            status: "waiting", startAt: 0, winner: "", left: "",
+            a: player(), b: null,
+          }, { expireIn: TTL })
+          .commit();
+        if (r.ok) return json({ room: code, you: "a" });
+      }
+      return json({ error: "busy" });
+    }
+
+    case "/join": {
+      const r = await mutate(room, (v) => {
+        if (v.b) return "full";
+        v.b = player();
+        v.status = "running";
+        v.startAt = now + START_DELAY;
+      });
+      if (!r) return json({ error: "nf" });
+      if (r[1] === "full") return json({ error: "full" });
+      return json({ ok: true, you: "b" });
+    }
+
+    case "/state": {
+      const pos = parseInt(q.get("pos") || "0") || 0;
+      const err = parseInt(q.get("err") || "0") || 0;
+      const r = await mutate(room, (v) => {
+        const me = v[you];
+        if (!me || v.status !== "running" || now < v.startAt) return;
+        const len = v.text.length;
+        const cap = Math.floor((now - v.startAt) / 1000 * MAX_CPS) + 6;
+        me.pos = Math.max(me.pos, Math.min(Math.max(0, pos), cap, len));
+        me.err = Math.min(Math.max(0, err), 999);
+        if (me.pos >= len) {
+          me.time = now - v.startAt;
+          v.winner = you;
+          v.status = "finished";
+        } else if (now - v.startAt > MAX_RACE) {
+          v.status = "finished";
+        }
+      });
+      if (!r) return json({ error: "nf" });
+      return json(view(r[0], now));
+    }
+
+    case "/leave": {
+      await mutate(room, (v) => {
+        if (v.status === "finished") return;
+        v.status = "finished";
+        if (!v.b) { v.winner = "x"; return; }
+        v.winner = you === "a" ? "b" : "a";
+        v.left = you;
+      });
+      return json({ ok: true });
+    }
+
+    default:
+      return json({ ok: true, service: "typing-duel" });
+  }
+}); 
